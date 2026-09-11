@@ -182,6 +182,59 @@ Prior to training the baseline classifier on `Dataset/processed/training_data.cs
 ### Decision:
 The weak labels demonstrate a **91.0% precision**, which substantially exceeds typical weak-supervision benchmarks (~80%). The training data is of high quality and ready to proceed with featurization and baseline classification (TF-IDF + Logistic Regression) without manual alterations or rule overfitting.
 
+---
+
+## Baseline Modeling Decision: TF-IDF + Multinomial Logistic Regression
+
+### 1. Why TF-IDF + Logistic Regression as the Initial Model?
+1. **Explainability & Line-by-Line Interpretability:**
+   - Feature weights can be directly printed and audited. If an inquiry is misclassified, we can instantly inspect which n-grams contributed the most log-odds to the decision.
+   - Ideal for production support engineering and interview defense: establishes an empirical lower bound before introducing heavier architectures.
+2. **Deterministic, Millisecond Training:**
+   - Trains in under a second on standard CPU with zero GPU dependencies or external API overhead.
+3. **Calibrated Confidence for Escalation:**
+   - Multinomial Logistic Regression produces well-calibrated softmax posterior probabilities ($P(y | x)$), making it naturally suited for setting downstream confidence thresholds to trigger human escalation.
+4. **Resilience to Weak Label Noise:**
+   - Standard L2 regularization ($C=1.0$) prevents the model from overfitting to idiosyncratic phrasing or minor errors in the weakly supervised training labels.
+
+### 2. Hyperparameter Choices & Rationale:
+* **`ngram_range=(1, 2)`:** Captures both unigrams (`battery`, `airpods`, `passcode`) and critical compound phrases (`spinning wheel`, `battery drain`, `sign in`, `touch screen`).
+* **`min_df=2`:** Discards single-occurrence typos, garbled text, and isolated handles.
+* **`max_features=5000`:** Bounds vocabulary dimensionality to prevent sparse memory bloat.
+* **`sublinear_tf=True`:** Uses sublinear term frequency scaling ($1 + \log(\text{tf})$) so repeated rant words do not disproportionately dominate the document vector.
+* **`class_weight='balanced'`:** Penalizes mistakes inversely proportional to class frequencies, ensuring minority classes are not suppressed.
+
+### 3. Empirical Performance Summary:
+* **Validation Split (20% holdout, 179 samples):**
+  - Accuracy: **91.06%**
+  - Macro F1: **90.03%**
+* **Golden Evaluation Set (Held-Out Ground Truth, 214 samples):**
+  - Accuracy: **70.56%** (151 / 214 correct)
+  - Macro F1: **61.98%**
+  - Strong performers: `Keyboard` (91.8% F1), `Battery` (83.0% F1), `Sound & Bluetooth` (75.3% F1), `Apps & Storage` (67.5% F1).
+  - Main challenge: The open-ended `Other` category (5 support in Golden Set) received 0 predictions due to training scarcity (only 14 examples in training pool), pulling down the unweighted macro average.
+
+---
+
+## Retrieval Engine Decision: TF-IDF + Cosine Similarity
+
+To ground automated reply generation and escalation decisions in historical brand behavior, a retrieval engine was developed to find the most relevant past customer conversations and official support responses.
+
+### Why TF-IDF + Cosine Similarity Over Embeddings / Vector Databases?
+1. **Lexical Precision for Technical Diagnostics:**
+   - Technical support inquiries rely heavily on exact identifiers: OS versions (`iOS 11.1`), product models (`iPhone 7 Plus`, `AirPods`), specific error strings (`error 3014`), and distinct symptoms (`spinning wheel`).
+   - Dense neural embeddings often exhibit semantic drift, falsely scoring unrelated hardware issues as similar simply because both tweets convey frustrated support sentiment. TF-IDF strictly rewards exact technical term overlap.
+2. **Deterministic & Ultra-Fast Execution:**
+   - Indexing 8,786 conversations takes ~0.5 seconds on a single CPU core.
+   - Query retrieval runs in ~5 milliseconds via sparse dot product (`cosine_similarity`).
+   - Zero infrastructure bloat: no external vector database servers, no Docker containers, and no recurring API embedding charges.
+3. **Line-by-Line Explainability:**
+   - Similarity scores can be directly audited by inspecting shared n-gram dot products. In an interview or production post-mortem, every retrieved reply can be justified deterministically.
+4. **Guaranteed Zero Data Leakage:**
+   - The retrieval corpus programmatically filters out all 214 Golden Set conversation IDs, ensuring that downstream evaluation of RAG responses remains strictly blind to test set conversations.
+
+
+
 
 
 
