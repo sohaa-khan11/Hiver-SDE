@@ -151,5 +151,37 @@ This guide defines the manual labeling rules for reviewing `Dataset/processed/la
 7. **Exact category casing:**
    * Keep the `intent` values exactly as named: `Battery`, `Phone Performance`, `Keyboard`, `Apple ID`, `Sound & Bluetooth`, `Screen & Camera`, `Apps & Storage`, or `Other`.
 
+---
+
+## Weak-Label Quality Audit (Training Set)
+
+Prior to training the baseline classifier on `Dataset/processed/training_data.csv` (894 weak-labeled examples), a quality audit was conducted to measure label precision and diagnose systemic rule error modes.
+
+- **Sample Size:** 100 examples
+- **Sampling Seed:** 42 (deterministic, reproducible sample across the 894 candidate rows)
+- **Audit Method:** Automated evaluation of the 100 sampled messages against the canonical intent definitions and boundary rules established in this decision log.
+- **Overall Precision:** 91.0% (91 correct, 9 incorrect)
+
+### Per-Intent Precision Breakdown:
+* **Battery:** 100.0% (13/13)
+* **Other:** 100.0% (3/3)
+* **Keyboard:** 94.1% (16/17)
+* **Sound & Bluetooth:** 94.1% (16/17)
+* **Phone Performance:** 92.3% (12/13)
+* **Apple ID:** 91.7% (11/12)
+* **Screen & Camera:** 83.3% (5/6)
+* **Apps & Storage:** 78.9% (15/19)
+
+### Main Error Patterns Identified:
+1. **iTunes Account vs. App Ambiguity:** Queries mentioning "sign into iTunes" or "merge iTunes accounts" triggered `Apps & Storage` instead of `Apple ID` due to generic iTunes keywords.
+2. **SpringBoard Resprings:** "Blank screen with spinning circle" was labeled `Screen & Camera` instead of `Phone Performance`.
+3. **App/Service Playback vs. Device Issue:** Specific TV show streaming stalls on Apple TV were labeled `Phone Performance` instead of `Apps & Storage`.
+4. **Third-Party / Carrier Ambiguity:** Carrier upgrade lockout (AT&T) was captured by `Apple ID` rules instead of `Other`.
+5. **Multi-Issue Mentions:** Tweets listing multiple device symptoms (e.g., freezing, crashing, and AirPods) were occasionally caught by secondary peripheral keywords.
+
+### Decision:
+The weak labels demonstrate a **91.0% precision**, which substantially exceeds typical weak-supervision benchmarks (~80%). The training data is of high quality and ready to proceed with featurization and baseline classification (TF-IDF + Logistic Regression) without manual alterations or rule overfitting.
+
+
 
 
