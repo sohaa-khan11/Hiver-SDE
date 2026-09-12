@@ -99,6 +99,14 @@ python src/retrieval/retrieve_similar.py
 * Indexes historical customer inquiries across 8,786 conversations from `Dataset/processed/apple_cleaned.csv` using TF-IDF.
 * Given a customer inquiry, retrieves the top 5 most similar historical issues and their corresponding official AppleSupport replies using cosine similarity.
 
+### Step 6: Run Reply-Generation Baselines
+```bash
+python src/agent/baseline_canned.py
+python src/agent/baseline_retrieval.py
+```
+* **Baseline 1 (Canned):** Generates generic corporate support macros based strictly on predicted intent without retrieval or LLMs.
+* **Baseline 2 (Retrieval-Only):** Directly returns the verbatim top-1 historical human AppleSupport reply without LLM rewriting.
+
 ---
 
 ## 5. Baseline Intent Classifier
@@ -133,7 +141,20 @@ The retrieval system provides grounded evidence for the downstream response gene
 
 ---
 
-## 7. Repository Structure
+## 7. Reply-Generation Baselines
+
+To benchmark response quality before building the final generative LLM agent, two non-LLM baselines are evaluated on all 214 Golden Set examples:
+
+1. **Baseline 1: Intent + Generic Canned Reply (`src/agent/baseline_canned.py`)**
+   - Maps the predicted intent directly to a static, professional canned troubleshooting macro.
+   - *Key Limitation:* Subject to cascading classification errors (wrong intent produces completely irrelevant advice) and cannot answer specific customer questions.
+2. **Baseline 2: Historical Retrieval Only (`src/agent/baseline_retrieval.py`)**
+   - Retrieves the top-1 most similar historical conversation from the 8,786-thread corpus (excluding the Golden Set) and returns the human agent's verbatim response.
+   - *Key Limitation:* Vulnerable to lexical mismatches and verbatim transfer artifacts (referencing someone else's name, dead links, or premature DM invites).
+
+---
+
+## 8. Repository Structure
 
 ```
 Hiver/
@@ -145,12 +166,17 @@ Hiver/
 │   └── processed/
 │       ├── apple_conversations.csv           # Extracted working dataset (26,129 rows)
 │       ├── apple_cleaned.csv                 # Cleaned dataset with text_clean (26,129 rows)
-│       ├── golden_set.csv                    # Final human-reviewed Golden Set (214 rows)
+│       ├── golden_set.csv                    # Final human-reviewed Golden Set with escalation (214 rows)
 │       ├── training_data.csv                 # Weakly labeled training pool (894 rows)
-│       └── golden_set_predictions.csv        # Baseline predictions on Golden Set
+│       ├── golden_set_predictions.csv        # Baseline intent predictions on Golden Set
+│       ├── baseline_canned_predictions.csv   # Baseline 1 canned replies on Golden Set
+│       └── baseline_retrieval_predictions.csv# Baseline 2 retrieval replies on Golden Set
 ├── docs/
 │   └── decision_log.md                       # Brand selection, cleaning, taxonomy, & modeling log
 └── src/
+    ├── agent/
+    │   ├── baseline_canned.py                # Baseline 1: Intent + Canned reply generator
+    │   └── baseline_retrieval.py             # Baseline 2: Retrieval-only reply generator
     ├── data/
     │   ├── extract_apple.py                  # Conversation extraction script
     │   ├── clean_apple.py                    # Conservative text preprocessing script

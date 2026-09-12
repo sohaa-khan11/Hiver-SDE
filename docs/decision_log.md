@@ -233,6 +233,86 @@ To ground automated reply generation and escalation decisions in historical bran
 4. **Guaranteed Zero Data Leakage:**
    - The retrieval corpus programmatically filters out all 214 Golden Set conversation IDs, ensuring that downstream evaluation of RAG responses remains strictly blind to test set conversations.
 
+---
+
+## Escalation Policy & Golden Set Ground Truth
+
+To evaluate whether the customer-support agent correctly chooses to **`AUTO-HANDLE`** or **`ESCALATE`** an inquiry, ground-truth labels and rationale were established across all 214 Golden Set conversations (`Dataset/processed/golden_set.csv`).
+
+### 1. Escalation Decision Principles
+
+The escalation policy is grounded in historical AppleSupport practices and realistic customer support safety constraints:
+
+1. **Account Security & Financial Privacy (`ESCALATE`):**
+   - Inquiries involving Apple ID credentials, forgotten passwords, 2FA/verification codes, trusted number recovery, account lockouts, unauthorized credit card charges, or refund disputes.
+   - *Rationale:* Automated bots must never handle raw credentials, payment information, or account unlocking without authenticated human oversight.
+2. **Physical Hardware Damage & Replacement (`ESCALATE`):**
+   - Broken screens, unresponsive touch digitizers, water damage, swollen batteries, broken headphone jacks, lost AirPods, hardware replacement claims, or requests to book Genius Bar retail appointments.
+   - *Rationale:* Hardware defects cannot be resolved through software instructions. They necessitate hands-on inspection, warranty validation, or an in-person technician appointment.
+3. **Critical System Instability & Persistent Failures (`ESCALATE`):**
+   - Unrecoverable boot loops (spinning wheel, stuck Apple logo), fatal iTunes restore errors (e.g., error 3014), or severe bricking where historical agents collected device serial numbers and private telemetry in DM.
+   - *Rationale:* If standard reboot/reset steps fail, deep hardware/software diagnostic triage is required.
+4. **Safe, Low-Risk Self-Service Troubleshooting (`AUTO-HANDLE`):**
+   - Known software bug workarounds (e.g., the universal iOS 11 letter "I" Text Replacement workaround), settings adjustments (disabling Live Photo or Auto HDR defaults, Bluetooth Control Center toggle behavior), informational how-to queries (checking battery health guidelines, iTunes Match vs. Apple Music explanations), and standard app settings (built-in music shuffle toggle, clearing storage).
+   - *Rationale:* High-confidence, repeatable procedures that can safely resolve the user's inquiry without risk of data loss or security exposure.
+
+### 2. Golden Set Escalation Distribution (214 Examples)
+
+- **`ESCALATE`:** 143 examples (**66.8%**)
+- **`AUTO-HANDLE`:** 71 examples (**33.2%**)
+
+#### Breakdown by Canonical Intent:
+* **Apple ID:** 22 ESCALATE (100.0%) | 0 AUTO-HANDLE (0.0%)
+* **Battery:** 25 ESCALATE (86.2%) | 4 AUTO-HANDLE (13.8%)
+* **Phone Performance:** 28 ESCALATE (75.7%) | 9 AUTO-HANDLE (24.3%)
+* **Screen & Camera:** 14 ESCALATE (73.7%) | 5 AUTO-HANDLE (26.3%)
+* **Apps & Storage:** 27 ESCALATE (69.2%) | 12 AUTO-HANDLE (30.8%)
+* **Sound & Bluetooth:** 16 ESCALATE (50.0%) | 16 AUTO-HANDLE (50.0%)
+* **Other:** 2 ESCALATE (40.0%) | 3 AUTO-HANDLE (60.0%)
+* **Keyboard:** 9 ESCALATE (29.0%) | 22 AUTO-HANDLE (71.0%)
+
+---
+
+## Reply-Generation Baselines Decision & Analysis
+
+Before developing the final generative LLM agent, two non-generative reply baselines were built and evaluated on all 214 Golden Set conversations (`Dataset/processed/golden_set.csv`) to establish empirical lower bounds and diagnose the necessity of an LLM.
+
+### 1. Why These Two Baselines Were Selected
+
+1. **Baseline 1: Intent + Generic Canned Reply (`src/agent/baseline_canned.py`)**
+   - *Design:* Maps the predicted intent from the baseline classifier to a fixed, professional canned troubleshooting macro.
+   - *Why Selected:* Represents traditional rules/intent-based customer chatbots. It tests how far static FAQ templates can go without retrieval or LLM inference.
+   - *Core Strength:* 100% predictable, safe, grammatically clean corporate boilerplate with zero risk of hallucination.
+   - *Core Weaknesses:*
+     - **Cascading Classification Errors:** When the classifier misidentifies the intent (29.44% of Golden Set), the canned reply provides advice for a completely wrong issue (e.g. telling a customer with a landscape keyboard glitch to clean their camera lens).
+     - **Zero Contextual Specificity:** Fails to answer direct questions (e.g. "can other people see my iCloud profile pic when I email them?" receives generic password reset advice).
+2. **Baseline 2: Historical Retrieval Only (`src/agent/baseline_retrieval.py`)**
+   - *Design:* Retrieves the top-1 most similar historical conversation from the 8,786-thread corpus (strictly excluding Golden Set IDs) and returns the human agent's verbatim response without LLM editing.
+   - *Why Selected:* Tests whether RAG retrieval alone is sufficient to resolve inquiries without a generative synthesis model.
+   - *Core Strength:* Surfaces authentic official troubleshooting steps, real diagnostic questions, and legitimate Apple support URLs.
+   - *Core Weaknesses:*
+     - **Verbatim Transfer Artifacts:** Historical replies frequently include previous customers' personal names (e.g., *"Hey, Ryan! Perhaps we can help..."*), dead links (`[URL]`), or unsolicited invitations to DM when the customer hasn't described their symptom yet.
+     - **Lexical Overlap Drift:** Generic tokens like *"recent update"* or *"iOS 11"* occasionally match an unrelated issue (e.g., a Safari VPN inquiry matching an autocorrect glitch).
+
+### 2. Empirical Summary Across All 214 Golden Set Examples
+
+| Metric | Baseline 1 (Canned Macro) | Baseline 2 (Retrieval-Only) |
+| :--- | :---: | :---: |
+| **Examples Evaluated** | 214 | 214 |
+| **Response Availability** | 100.0% (214/214) | 100.0% (214/214 with Sim > 0) |
+| **Mean Word Count** | 27.4 words (min: 24, max: 33) | 22.6 words (min: 8, max: 50) |
+| **Mean Character Count** | 178.3 chars (min: 170, max: 208) | 117.7 chars (min: 40, max: 273) |
+| **Mean Token Jaccard Overlap**| 0.0426 | 0.0429 |
+| **Mean Similarity Score** | N/A (Intent-derived) | 0.3851 (min: 0.1458, max: 1.0000) |
+
+### 3. Justification for the Final LLM Agent
+This comparative analysis proves that neither baseline is acceptable for production:
+- **Baseline 1** possesses structure and safety, but lacks grounded contextual specificity.
+- **Baseline 2** possesses authentic domain specificity, but lacks conversational adaptation, synthesis, and sanitization.
+This directly justifies the final RAG + LLM architecture: using the **predicted intent for structure/escalation guardrails**, the **retrieved replies as factual grounding evidence**, and the **LLM to synthesize a tailored, empathetic, and sanitized support response**.
+
+
+
 
 
 
