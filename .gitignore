@@ -1,5 +1,10 @@
 # Large Raw Datasets (TWCS ~493 MB)
-Dataset/twcs/twitter_support.csv
+Dataset/twcs/
+
+# Generated & Intermediate Processed Datasets
+Dataset/processed/*
+!Dataset/processed/golden_set.csv
+!Dataset/processed/training_data.csv
 
 # Python
 __pycache__/
