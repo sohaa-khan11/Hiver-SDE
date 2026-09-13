@@ -461,7 +461,7 @@ def compute_human_agreement(template_path: str, judge_df: Optional[pd.DataFrame]
             "total_review_samples": len(human_df)
         }
 
-    agent_judge = judge_df[judge_df["model_name"] == "Final Support Agent"].set_index("sample_id")
+    agent_judge = judge_df[judge_df["model_name"] == "Final Support Agent"].set_index("sample_id").drop(columns=["conversation_id"], errors="ignore")
     merged = human_df.join(agent_judge, on="sample_id", how="inner")
 
     if len(merged) == 0:

@@ -81,21 +81,93 @@ def clean_evidence_text(text: str) -> str:
     return cleaned.strip()
 
 
-def sanitize_llm_response(text: str) -> str:
-    """Sanitize LLM output to truncate meta-commentary or multiple hypothetical branches."""
-    # Truncate if model outputs meta-hypothetical phrases
-    split_patterns = [
-        r"\n\s*If the historical cases are not sufficient",
-        r"\n\s*Alternative response:",
-        r"\n\s*Note:",
-        r"\n\s*Here is the reply:",
-    ]
-    cleaned = text
-    for pat in split_patterns:
-        parts = re.split(pat, cleaned, flags=re.IGNORECASE)
-        if len(parts) > 1 and parts[0].strip():
-            cleaned = parts[0].strip()
-    return cleaned.strip()
+# Internal prompt/context section headings. If the model echoes any of these
+# anywhere in its output, everything from that point on is prompt/context
+# leakage, not a customer-facing answer -- regardless of what whitespace or
+# newlines precede it (we cannot rely on the model always leaking in exactly
+# the same format, and Ollama's "stop" sequences are a best-effort defense,
+# not a guarantee).
+_INTERNAL_LEAK_MARKERS = [
+    "current customer inquiry:",
+    "predicted category:",
+    "historical applesupport evidence",
+    "customer-facing support reply:",
+    "if the historical cases are not sufficient",
+    "alternative response:",
+    "here is the reply:",
+]
+
+# A standalone line made only of dashes/equals/underscores (a markdown-style
+# divider) is also a strong signal the model has stopped answering and
+# started echoing prompt structure.
+_SEPARATOR_LINE_RE = re.compile(r"(?m)^[ \t]*[-=_]{3,}[ \t]*$")
+
+
+def _find_leak_start(text: str) -> Optional[int]:
+    """Return the index of the earliest internal-prompt leak marker in text, or None."""
+    lower = text.lower()
+    candidates = [idx for idx in (lower.find(marker) for marker in _INTERNAL_LEAK_MARKERS) if idx != -1]
+    sep_match = _SEPARATOR_LINE_RE.search(text)
+    if sep_match:
+        candidates.append(sep_match.start())
+    return min(candidates) if candidates else None
+
+
+def sanitize_llm_response(text: str, fallback: str = "") -> str:
+    """
+    Sanitize LLM output:
+    1. Strips leaked prompt headings, separator lines, and prompt template continuation
+       by cutting the text at the earliest point ANY internal marker appears, regardless
+       of the exact whitespace/newline formatting around it.
+    2. Strips meta-commentary, alternative responses, and hypothetical branches.
+    3. Truncates at quotation wrappers.
+    4. Detects and fixes model token-merging glitches (e.g. experien011ng, experien01).
+    5. Validates minimum length and clean sentence boundaries, falling back safely if corrupted.
+    """
+    cleaned = text.strip()
+
+    # If the response is wrapped in outer quotes, strip them
+    if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'''") and cleaned.endswith("'''")):
+        cleaned = cleaned.strip('"\'')
+
+    # Cut everything from the earliest leaked internal marker or separator line onward.
+    # Unlike a newline-anchored regex, this catches leakage no matter how many blank
+    # lines, dashes, or formatting variations the model puts around it.
+    leak_idx = _find_leak_start(cleaned)
+    if leak_idx is not None and cleaned[:leak_idx].strip():
+        cleaned = cleaned[:leak_idx].strip()
+
+    # Clean leading leaked markers if model begins by echoing them
+    cleaned = re.sub(r"^(?:Customer-Facing Support Reply:\s*)+", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # Fix known phi3 token-glitch digit-merges, e.g. "experien011ng" or "experien01"
+    # both collapse to "experiencing" (conservative: only triggers on this exact
+    # "experien<digits>" glitch pattern, so normal words are never touched).
+    cleaned = re.sub(r"\bexperien\w*\d+\w*\b", "experiencing", cleaned, flags=re.IGNORECASE)
+
+    # General check: detect stray digit corruption inside words (e.g. word0128ing, crash01)
+    corrupted_words = re.findall(r"\b[a-zA-Z]{3,}\d+[a-zA-Z]*\b", cleaned)
+    if corrupted_words:
+        for cw in corrupted_words:
+            # If it's a known device model like iPhone8, iOS11, 6s, ignore
+            if re.match(r"^(?:iphone\d+|ios\d+|\d+s|\d+plus|s\d+)$", cw, flags=re.IGNORECASE):
+                continue
+            # Otherwise, strip the embedded digits if removing them forms clean text
+            fixed = re.sub(r"\d+", "", cw)
+            cleaned = re.sub(rf"\b{re.escape(cw)}\b", fixed, cleaned)
+
+    # Ensure clean ending punctuation (truncate mid-sentence cuts)
+    cleaned = cleaned.strip()
+    if cleaned and cleaned[-1] not in ".!?":
+        last_punct = max(cleaned.rfind('.'), cleaned.rfind('!'), cleaned.rfind('?'))
+        if last_punct > 20:
+            cleaned = cleaned[:last_punct + 1]
+
+    # If cleaning reduced the text to unusable length or empty, fail safely to fallback
+    if len(cleaned.split()) < 5 and fallback:
+        return fallback
+
+    return cleaned
 
 
 def call_llm_api(
@@ -116,6 +188,8 @@ def call_llm_api(
 
     ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     model_name = os.environ.get("OLLAMA_MODEL", "phi3:mini")
+    best_reply = retrieved_examples[0]["first_reply"] if retrieved_examples else "Please reach out to Apple Support."
+    safe_fallback = clean_evidence_text(best_reply)
 
     # Format the top 3-5 historical examples as evidence blocks
     evidence_blocks = []
@@ -144,7 +218,14 @@ Customer-Facing Support Reply:"""
         ],
         "options": {
             "temperature": 0.2,
-            "num_predict": 180
+            "num_predict": 180,
+            "stop": [
+                "\n---",
+                "\nCurrent Customer Inquiry:",
+                "\nPredicted Category:",
+                "\nHistorical AppleSupport Evidence:",
+                "\nCustomer-Facing Support Reply:"
+            ]
         },
         "stream": False
     }
@@ -161,20 +242,19 @@ Customer-Facing Support Reply:"""
                 res = json.loads(resp.read().decode("utf-8"))
             response_text = res.get("message", {}).get("content", "").strip()
             if response_text:
-                return sanitize_llm_response(response_text), True
+                sanitized = sanitize_llm_response(response_text, fallback=safe_fallback)
+                return sanitized, True
         except Exception as e:
             if attempt == 1:
                 # On persistent connection failure, fail safely with reference evidence
-                best_reply = retrieved_examples[0]["first_reply"] if retrieved_examples else "Please reach out to Apple Support."
                 fallback_msg = (
                     f"[Ollama Service Offline / Fallback: {e}]\n"
-                    f"       Synthesized from {len(retrieved_examples)} retrieved cases. Primary reference: \"{clean_evidence_text(best_reply)}\""
+                    f"       Synthesized from {len(retrieved_examples)} retrieved cases. Primary reference: \"{safe_fallback}\""
                 )
                 return fallback_msg, False
             time.sleep(1)
 
-    best_reply = retrieved_examples[0]["first_reply"] if retrieved_examples else "Please reach out to Apple Support."
-    return f"[Ollama empty response. Fallback: {clean_evidence_text(best_reply)}]", False
+    return f"[Ollama empty response. Fallback: {safe_fallback}]", False
 
 
 # ==============================================================================
