@@ -1,343 +1,323 @@
-# AppleSupport AI Customer Support Assistant
+# AppleSupport Customer Support Agent
 
-An end-to-end AI customer support pipeline built from the Kaggle [Customer Support on Twitter (TWCS)](https://www.kaggle.com/datasets/thoughtvector/customer-support-on-twitter) dataset for the **Hiver SDE Take-Home Assignment**.
-
-The system classifies incoming customer inquiries, retrieves grounded historical resolutions from official AppleSupport conversations, applies an explainable deterministic escalation policy, and uses an LLM to synthesize concise, hallucination-free support responses.
+**Hiver SDE Intern**
 
 ---
 
-## 1. Problem Framing & Architecture
+## What This Is
 
-### Pipeline Flow
+I built a small AI customer support agent for AppleSupport, using a real dataset of Twitter support conversations (the Kaggle TWCS dataset — about 2.8 million tweets from 108 different brands).
 
-```text
-Incoming Customer Message
-           │
-           ▼
-[Step 1] Intent Classifier (TF-IDF + Logistic Regression)
-           │
-           ├── Intent & Calibrated Confidence Score
-           │
-           ▼
-[Step 2] Historical Evidence Retrieval (TF-IDF + Cosine Similarity)
-           │
-           ├── Top 3–5 Historical Cases (Excluding Golden Set IDs)
-           │
-           ▼
-[Step 3] Deterministic Escalation Policy (Rule-Based Guardrails)
-           │
-     ┌─────┴──────────────────────┐
-     │                            │
-[ESCALATE]                   [AUTO-HANDLE]
-     │                            │
-     ▼                            ▼
-Safe Human-Routing Reply     [Step 4] Grounded LLM Rewriter
-(Account Security, Repairs,  (Synthesizes evidence, strips noise,
- Severe System Crashes)       strictly zero hallucinated facts)
-     │                            │
-     └─────────────┬──────────────┘
-                   │
-                   ▼
-       Final Customer Response
+The system does three things when a customer message comes in:
+
+1. **Figures out what the customer needs** (e.g., is it a battery problem, an Apple ID issue, a cracked screen?)
+2. **Decides whether to handle it automatically or escalate to a human** (e.g., never let a bot deal with someone locked out of their account)
+3. **Writes a reply grounded in how AppleSupport actually handled similar problems in the past** — so it does not make things up
+
+---
+
+## Why AppleSupport?
+
+I compared the three biggest brands in the dataset before picking one.
+
+| | AppleSupport | SpotifyCares | Delta |
+|---|---|---|---|
+| Total support replies in dataset | 106,860 | 43,265 | 42,253 |
+| Conversations with real troubleshooting steps | 22.25% | 18.14% | 4.99% |
+| Agent signature noise (e.g. `/LS`, `*QB`) | 0% | 74.68% | 82.30% |
+
+Delta's replies were mostly "your flight is delayed, call this number." Spotify's replies were contaminated with employee initials that would pollute any retrieval system. AppleSupport had the richest technical content — real steps like "Go to Settings > General > About and check your iOS version" — and zero noise. That made it the best corpus to learn from and retrieve from.
+
+---
+
+## What "Good" Looks Like for AppleSupport
+
+Before I wrote a single line of code, I thought about what a good AppleSupport reply actually looks like.
+
+A good reply:
+- Addresses the customer's specific problem, not a generic template
+- Never asks for a password or account credentials in a public chat thread
+- Does not guess at hardware repair costs or promise outcomes
+- Is concise — AppleSupport replies on Twitter average about 30 words
+- Gives concrete next steps (a settings path, a reset sequence, an official support link)
+
+A bad reply:
+- Copies a previous customer's name ("Hey Ryan, thanks for reaching out!")
+- Refers the customer to a dead 2017 Apple support link
+- Pretends it can fix a cracked screen with software advice
+
+**What I chose NOT to build:**
+- A fine-tuned language model (the dataset is real customer data; fine-tuning risks memorising private information)
+- A retrieval system that just pastes the most similar old reply verbatim (this is Baseline 2, and it fails badly — see results)
+- A rule-based chatbot with 50 handcrafted if/else branches (would collapse the moment a customer uses unexpected phrasing)
+- Any dependency on paid cloud APIs (everything runs locally, no keys needed)
+
+---
+
+## How It Works
+
+```
+Customer message
+       |
+[Step 1] Intent classifier
+         TF-IDF + Logistic Regression -> "Battery", "Apple ID", "Keyboard", etc.
+       |
+[Step 2] Historical retrieval
+         Finds the top 4 most similar real AppleSupport conversations from the past
+       |
+[Step 3] Escalation check (runs BEFORE any LLM)
+         Rule-based: account credentials? cracked hardware? boot loop? -> ESCALATE
+         Classifier not confident (< 35%)? -> ESCALATE
+         Everything else -> AUTO-HANDLE
+       |
+[Step 4] LLM reply writer (only for AUTO-HANDLE cases)
+         Rewrites the retrieved evidence for this specific customer
+         Runs locally via Ollama (phi3:mini, no internet required)
+       |
+Final reply
 ```
 
-### Core Design Philosophy
-1. **Zero Hallucination via Constrained Synthesis**: The LLM is **never** asked to generate technical troubleshooting procedures from memory. It is constrained to adapt the verified historical AppleSupport replies retrieved for that specific problem.
-2. **Deterministic Safety Guardrail**: Escalation decisions (account security, physical hardware damage, severe boot loops) are handled **before** the LLM call using explainable rules. LLMs are never allowed to make escalation decisions.
-3. **Reproducibility with Zero Leakage**: The final 214-example evaluation set (`Dataset/processed/golden_set.csv`) was sampled at the conversation level, initially labeled with an automated/AI-assisted process, then manually reviewed and corrected to produce the final benchmark. All Golden Set conversation IDs are programmatically excluded from the historical retrieval index.
+The escalation check happens **before** the LLM, not after. The LLM is never allowed to decide whether something is safe to handle — that is always a deterministic rule.
 
 ---
 
-## 2. Why AppleSupport Was Selected
+## The 8 Intent Categories
 
-Out of the 108 brands in TWCS, we compared the three largest candidate brands: `AppleSupport`, `SpotifyCares`, and `Delta`.
+I went through roughly 9,000 conversation threads and grouped what customers actually complained about:
 
-| Evaluation Metric | AppleSupport | SpotifyCares | Delta |
-| :--- | :---: | :---: | :---: |
-| **Brand Outbound Tweets** | **106,860** | 43,265 | 42,253 |
-| **Valid Root Conversations** | **80,250** | 26,940 | 28,485 |
-| **Actionable Troubleshooting Rate** | **22.25%** | 18.14% | 4.99% |
-| **Agent Signature Noise** | **0.00%** (Clean) | 74.68% (`/LS`) | 82.30% (`*QB`) |
-| **Direct Message (DM) Routing** | 46.92% | 31.35% | 15.17% |
+1. **Battery** — fast drain, sudden shutdowns, won't charge
+2. **Phone Performance** — freezing, stuttering, random reboots
+3. **Keyboard** — the iOS 11 autocorrect "I" to "A [?]" bug was a huge spike in complaints
+4. **Apple ID** — forgotten passwords, lockouts, 2FA, mystery billing charges
+5. **Sound & Bluetooth** — AirPods disconnecting, Bluetooth won't pair, speaker issues
+6. **Screen & Camera** — cracked glass, black camera viewfinder, touch not working
+7. **Apps & Storage** — app won't download, storage full, app crashing on open
+8. **Other** — everything else: general venting, unrelated questions, social chatter
 
-* **Troubleshooting Richness**: 22.25% of AppleSupport replies contain concrete technical steps (settings navigation, iOS version checks, hardware resets) compared to 4.99% for Delta (mostly flight booking lookups).
-* **Zero Signature Noise**: Apple maintains a unified brand voice with 0% employee initials, avoiding contaminated training or retrieval targets.
-* **Explainable Support Boundaries**: Clear technical demarcations between self-service software workarounds and physical hardware repair needs.
-
----
-
-## 3. Intent Taxonomy
-
-Analyzing opening customer inquiries across 9,000 reconstructed threads yielded an 8-category support taxonomy:
-
-1. **`Battery` (11.2%)**: Fast drain, sudden shutdowns, charging cable/port failures.
-2. **`Phone Performance` (8.4%)**: System freezing, UI stutter, random reboots, boot loops.
-3. **`Keyboard` (8.6%)**: iOS 11 `"I"` autocorrect glitch (`"A [?]"`), predictive text bugs.
-4. **`Apple ID` (4.6%)**: Forgotten passwords, account lockouts, 2FA codes, billing charges.
-5. **`Sound & Bluetooth` (3.4%)**: AirPods disconnects, Bluetooth pairing, speaker/mic audio.
-6. **`Screen & Camera` (5.8%)**: Cracked screens, black camera viewfinders, touch digitizer failure.
-7. **`Apps & Storage` (4.6%)**: App Store download loops, storage full alerts, app crashes.
-8. **`Other` (59.0% raw / 2.3% Golden)**: General rants, social chatter, out-of-scope requests.
+"Other" is 59% of raw incoming messages but only 2.3% of the Golden Set (the evaluation benchmark), because most "Other" messages do not need a support agent response at all.
 
 ---
 
-## 4. Data Provenance & Governance
+## The Data Setup
 
-To maintain strict scientific and engineering rigor, the project clearly separates four tiers of data:
+I kept four things strictly separate to avoid cheating in the evaluation:
 
-1. **Historical Retrieval Corpus (`Dataset/processed/apple_cleaned.csv`)**:
-   - 8,786 authentic historical AppleSupport conversations extracted from TWCS and conservatively cleaned.
-   - Strictly filtered to exclude all benchmark conversation IDs to guarantee zero retrieval leakage.
-2. **Weak-Labeled Training Set (`Dataset/processed/training_data.csv`, 894 rows)**:
-   - Generated using keyword and regex heuristics over non-benchmark conversations.
-   - An automated audit of 100 randomly sampled examples verified **91.0% precision** against taxonomy rules.
-3. **Manually Reviewed Golden Benchmark (`Dataset/processed/golden_set.csv`, 214 rows)**:
-   - Sampled at the conversation level, initially labeled with an automated/AI-assisted process, then manually reviewed and corrected to produce the final evaluation benchmark.
-   - Kept completely separate and frozen; never seen during classifier training or retrieval indexing.
-4. **Policy-Derived Escalation Labels**:
-   - The escalation ground truth in the Golden Set was created by applying defined safety policy rules (account security, physical damage, severe bootloops).
-   - **Important**: These are policy-derived evaluation targets, not historical observed customer outcomes.
+| Data | What it is | Used for |
+|---|---|---|
+| `apple_cleaned.csv` | 8,786 historical AppleSupport conversations | Retrieval only |
+| `training_data.csv` | 894 labeled examples (keyword rules) | Training the classifier |
+| `golden_set.csv` | 214 held-out examples (manually reviewed) | Evaluation only |
+| Escalation labels | Policy-derived labels (not real observed outcomes) | Testing escalation rules |
+
+The 214-example Golden Set was sampled at the conversation level, initially labeled using automated rules, then manually reviewed and corrected. All 214 conversation IDs are blocked from appearing in retrieval — so the agent can never "cheat" by finding its own test cases.
 
 ---
 
-## 5. Historical Retrieval Engine
+## Results vs. the Two Baselines
 
-* **Corpus**: 8,786 historical AppleSupport conversation threads indexed from `Dataset/processed/apple_cleaned.csv` (excluding all 214 Golden Set conversation IDs).
-* **Method**: Sparse TF-IDF vectorizer + Cosine dot-product.
-* **Multi-Case Context**: Retrieves top 3–5 similar cases (`top_k=4` default). Technical support relies on exact tokens (`"iOS 11.0.2"`, `"AirPods"`, `"error 3014"`). Presenting multiple historical cases allows the downstream synthesizer to ignore irrelevant matches (e.g. a lost AirPod case) and extract relevant diagnostic questions (e.g. asking for device model and iOS version).
+I ran everything on all 214 Golden Set conversations.
 
----
+### Intent Classification
 
-## 6. Deterministic Escalation Policy
+| Evaluated on | Accuracy | Macro F1 |
+|---|---|---|
+| Validation split (20% of training data) | 91.06% | 90.03% |
+| Golden Set (real held-out benchmark) | 70.56% | 61.98% |
 
-Before invoking the LLM, the system applies explainable rule-based safety guardrails:
+The 91% number is misleading — see the section below on that.
 
-1. **Account Credentials & Financial Security (`ESCALATE`)**: Apple ID password resets, 2FA, account lockouts, billing charges. Bots must never request credentials in chat.
-2. **Physical Hardware Defects & Replacements (`ESCALATE`)**: Cracked glass, liquid damage, battery swelling, hardware button failures, Genius Bar appointments. Software cannot repair cracked glass.
-3. **Severe System Instability (`ESCALATE`)**: Unrecoverable boot loops, bricked recovery screens, iTunes restore error 3014.
-4. **Classifier Ambiguity (`ESCALATE`)**: Inquiries with softmax confidence `< 0.35` are routed to human triage to prevent confident misdirection.
-5. **Safe Inquiries (`AUTO-HANDLE`)**: Software troubleshooting, settings navigation, and verified workarounds.
+Per-intent F1 on the Golden Set:
+`Keyboard` 91.8% -> `Battery` 83.0% -> `Sound & Bluetooth` 75.3% -> `Apps & Storage` 67.5% -> `Phone Performance` 62.2% -> `Apple ID` 58.8% -> `Screen & Camera` 54.2% -> `Other` 0.0%
 
----
+`Other` scored 0% because it had only 5 examples in the benchmark and a logistic regression trained on keyword patterns cannot reliably catch "everything else."
 
-## 7. Reply-Generation Baselines
+### Escalation Policy
 
-To prove the necessity and value of the final LLM agent, we established two non-generative baselines across all 214 Golden Set conversations:
+| | Accuracy | Macro F1 |
+|---|---|---|
+| Escalation adherence | 62.15% | 59.04% |
 
-* **Baseline 1 (Intent + Generic Canned Reply)**: Maps predicted intent to a fixed corporate troubleshooting macro. Safe and predictable, but suffers from cascading misclassification errors and zero personalization.
-* **Baseline 2 (Historical Retrieval Only)**: Returns the verbatim top-1 historical human agent reply. Rich in domain knowledge, but blindly copies previous customers' names (`"Hey Ryan!"`), dead links, and unhelpful one-line DM invites.
+Out of 143 conversations that should have been escalated: 96 correctly escalated, 47 incorrectly auto-handled.
+Out of 71 conversations that should have been auto-handled: 37 correctly handled, 34 over-escalated.
 
----
+The escalation score is tied to the classifier — if the classifier calls an Apple ID issue "Apps & Storage," the escalation rule for account credentials never fires. So errors cascade.
 
-## 8. Comprehensive Evaluation Results
+### Reply Quality (all 214 cases, automated word-overlap proxy)
 
-### A. Intent Classification Performance
-* **Training Validation Split (20% holdout, 179 samples)**:
-  - Accuracy: **91.06%** | Macro F1: **90.03%**
-* **Golden Set Evaluation (Held-Out Benchmark, 214 samples)**:
-  - Accuracy: **70.56%** (151 / 214 correct) | Macro F1: **61.98%**
-  - Per-Intent F1: `Keyboard` (91.8%), `Battery` (83.0%), `Sound & Bluetooth` (75.3%), `Apps & Storage` (67.5%), `Phone Performance` (62.2%), `Apple ID` (58.8%), `Screen & Camera` (54.2%), `Other` (0.0%).
+| System | Avg reply length | Handles escalation? | Personalised? |
+|---|---|---|---|
+| Baseline 1 — Canned reply | 27 words | No | No |
+| Baseline 2 — Copy top retrieval hit | 23 words | No | No (copies old names) |
+| **Final Agent** | **32 words** | **Yes (60.7% of cases)** | **Yes** |
 
-### B. Escalation Policy Evaluation (vs 214 Golden Policy Labels)
-* **Accuracy**: **62.15%** | **Macro F1**: **59.04%**
-* **Confusion Matrix**:
-  - True `AUTO-HANDLE` (n=71): 37 Correct (52.1%), 34 False Escalations
-  - True `ESCALATE` (n=143): 96 Correct (67.1%), 47 False Auto-Handles
-* **Circularity & Cascading Errors**:
-  The escalation ground-truth labels are policy-derived targets based on defined safety criteria, not real-world observed escalation outcomes. Furthermore, the agent's escalation policy rules use predicted intent. When the classifier misidentifies an intent (e.g. classifying an Apple ID password issue as Apps & Storage), it misses the credential escalation rule. Because both the labeling policy and agent rules share the same domain criteria, this evaluation tests rule alignment and pipeline adherence rather than unbiased real-world accuracy.
+Neither baseline handles escalation at all — they send a troubleshooting reply to everyone, including people with cracked screens or locked accounts. The final agent routes 130 out of 214 conversations to human agents with an explanation, and generates a grounded reply only for the remaining cases it can safely handle.
 
-### C. Automated Reply Quality Comparison (214 Cases)
-*Note: Lexical Jaccard overlap is reported strictly as an automated word-overlap proxy, not a true semantic quality measure.*
+### LLM-as-Judge Results (25-case stratified sample, local phi3:mini)
 
-| Model | Response Availability | Avg Word Count | Avg Char Count | Cust Overlap Proxy (Jaccard) | Actionable Guidance Rate | Escalation Handled |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Baseline 1 (Canned)** | 100% | 27.4 | 178.3 | 0.0498 | 100.0% | 0.0% (None) |
-| **Baseline 2 (Retrieval-Only)** | 100% | 22.6 | 117.7 | 0.0548 | 82.7% | 0.0% (None) |
-| **Final Support Agent** | 100% | 31.6 | 189.7 | 0.0408 | 46.3% | **60.7% (130/214)** |
+The judge evaluated each reply on five criteria, scored 1-5:
 
----
+| System | Groundedness | Relevance | Actionability | Tone | Unsupported claim rate |
+|---|---|---|---|---|---|
+| Baseline 1 — Canned | 3.44 | 3.52 | 4.20 | 4.56 | 0.00 |
+| Baseline 2 — Retrieval | 3.88 | 4.28 | 3.96 | 4.56 | 0.04 |
+| **Final Agent** | **4.36** | **4.40** | **4.48** | **4.84** | 0.04 |
 
-## 9. LLM-as-Judge Evaluation Framework
+The final agent scored highest on every dimension. The canned baseline had zero unsupported claims because it is a fixed template — but it also scored lowest on relevance and groundedness because the template does not adapt to the actual complaint.
 
-To evaluate generation quality without relying on closed proprietary APIs or incurring cloud expenses, the evaluation harness uses a local open-weight instruction-tuned model (`phi3:mini`, 3.8B parameters via local Ollama).
+**Important caveat:** The same local model (`phi3:mini`) that generated the agent's replies also judged them. A model tends to prefer output in its own style. Treat these scores as directional signals, not as a reliable quality measure. The human ratings below show how large the gap can be.
 
-The harness selects an optimized representative **25-case stratified sample** from the Golden Set (seed=42, covering all 8 intents) and evaluates Baseline 1, Baseline 2, and Final Agent across 5 criteria:
+### Human vs LLM Judge Agreement (25 paired cases)
 
-1. **Groundedness (1–5)**: Supported strictly by official Apple evidence; zero invented facts.
-2. **Relevance (1–5)**: Addresses the current customer's specific problem.
-3. **Actionability (1–5)**: Provides concrete next steps, links, or diagnostic questions.
-4. **Support Tone (1–5)**: Polite, concise, empathetic social customer voice.
-5. **Unsupported Claim Rate (0 or 1)**: Flags hallucinated prices, repair promises, or fake steps.
+After completing the LLM judge run, the same 25 cases were rated manually on the Final Agent's replies:
 
-### Empirical LLM-as-Judge Results (Local `phi3:mini`, n=25 Sample):
+| Criterion | LLM judge avg | Human avg | MAE |
+|---|---|---|---|
+| Groundedness | 4.36 | 2.76 | 1.760 |
+| Relevance | 4.40 | 2.80 | 1.920 |
+| Actionability | 4.48 | 2.72 | 1.840 |
+| Tone | 4.84 | 4.36 | 0.720 |
+| Unsupported claim exact agreement | — | — | 76.0% |
 
-| Model | Groundedness (1–5) | Relevance (1–5) | Actionability (1–5) | Tone (1–5) | Unsupported Claim Rate (0–1) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Baseline 1 (Canned)** | 3.44 | 3.56 | 4.24 | 4.56 | **0.00** |
-| **Baseline 2 (Retrieval)** | 3.88 | 4.28 | 3.96 | 4.56 | 0.04 |
-| **Final Support Agent** | **4.32** | **4.40** | **4.48** | **4.84** | 0.04 |
+The MAE on groundedness, relevance, and actionability is close to 2 points on a 5-point scale. The LLM judge rated itself far higher than the human reviewer did on the same replies. Tone was the only dimension where there was reasonable agreement (MAE 0.72), which makes sense — tone is easier to assess from surface features than factual grounding is.
 
-### Key Findings & Self-Grading Bias:
-* **Groundedness Gain (+0.88 vs Canned, +0.44 vs Retrieval)**: The Final Agent combines retrieved troubleshooting facts with customer-specific context, eliminating generic advice without blindly quoting raw past conversations.
-* **Tone & Relevance**: The Final Agent achieved the highest tone (4.84/5) and relevance (4.40/5) by stripping previous customers' names and greeting the current user directly.
-* **Important Self-Grading Bias Limitation**: Because `phi3:mini` served both as the response generator and the comparative judge, same-model preference bias is a recognized factor. While temperature was set to 0.0 and JSON schema constrained the evaluation, formal validation requires independent human ratings.
-* **Execution & Persistent Caching**:
-  - Live generated replies are cached to `Dataset/processed/llm_generation_cache.csv`.
-  - Judge scores are cached to `Dataset/processed/llm_judge_results.csv`.
-  - Re-running `python src/evaluation/evaluate_system.py` loads both caches instantly (0 repeated inference calls).
+This confirms the self-grading bias documented above. The LLM judge results should be read as a ranking tool (which system did better relative to the others?) rather than as an absolute quality score.
 
 ---
 
-## 10. Human vs. LLM Judge Agreement
+## Top 5 Failure Modes
 
-The assignment requires evaluating human-vs-LLM agreement to validate the judge's scoring reliability:
-* The harness automatically maintains `Dataset/processed/human_eval_template.csv` containing the **exact same 25 sampled cases** used for the LLM judge.
-* In accordance with academic honesty, **human scores are not fabricated or pre-filled**. Rating columns (`human_groundedness_1to5`, `human_relevance_1to5`, etc.) remain blank for authentic review.
-* **Current Status**: **Pending Manual Human Review**.
-* Once filled, running `python src/evaluation/evaluate_system.py` automatically computes exact agreement on binary unsupported claims and Mean Absolute Error (MAE) for the 1–5 metrics.
+These are real cases from the Golden Set where things went wrong, with my best hypothesis for why.
 
----
+**1. Keyboard misclassified as Screen & Camera (conversation 427841)**
 
-## 11. Top 5 Real Failures & Root-Cause Analysis
+The customer wrote: *"Hi I'm using ios 11.0.2 on iPhone 6, keyboard doesn't fill screen when device rotated on landscape? Please solve this."*
 
-Analyzing actual errors from the 214 Golden Set predictions reveals key systemic failure patterns:
+The model predicted `Screen & Camera`. Why? The message contains both "keyboard" and "screen ... landscape" — and the TF-IDF weight for "screen" is higher because screen complaints are more common in training. The actual issue is a keyboard layout bug. A model that understands syntax would read "landscape mode" as a modifier of "keyboard," not as an independent screen complaint.
 
-1. **CID 427841** (`Keyboard` $\rightarrow$ Predicted `Screen & Camera`)
-   - *Message*: *"Hi I'm using ios 11.0.2 on iPhone 6, keyboard doesn't fill screen when device rotated on landscape? Please solve this..."*
-   - *Cause*: Co-occurrence of `"keyboard"` and `"screen... landscape"`. Strong n-gram weights for `"screen"` dominated.
-   - *Improvement*: Contextual dependency parsing or giving higher priority to input-method tokens.
-2. **CID 811638** (`Apple ID` $\rightarrow$ Predicted `Apps & Storage`)
-   - *Message*: *"Hi trying to download a game on to my phone but keeps telling payment failed, can't sign in to itunes too"*
-   - *Cause*: Lexical overlap between downloading an app and iTunes Store authentication / payment failure.
-   - *Improvement*: Elevating authentication/payment failure keywords to override generic app-download tokens.
-3. **CID 2064248** (`Screen & Camera` $\rightarrow$ Predicted `Phone Performance`)
-   - *Message*: *"updated 11.0.2 and now my phone is freezing up and screen rotation sticking in landscape mode!!!!"*
-   - *Cause*: Multi-symptom complaint. Bag-of-words representation cannot determine which grievance is primary when both "freezing up" and "screen rotation" appear.
-   - *Improvement*: Multi-label classification or hierarchical intent prediction.
-4. **CID 1028445** (`Battery` $\rightarrow$ Predicted `Sound & Bluetooth`)
-   - *Message*: *"my phone died and now ive plugged it in and its comepletly blackscreen and it wont even show the charging symbol HELP @AppleSupport"*
-   - *Cause*: Vocabulary starvation on power failure verbs without the explicit word `"battery"`.
-   - *Improvement*: Expanding weak-supervision regexes for charging hardware terms (`"plugged it in"`, `"charging symbol"`).
-5. **AirPods Disconnection Retrieval Drift**
-   - *Message*: *"My AirPods keep disconnecting from Bluetooth"*
-   - *Cause*: In top-1 retrieval, the highest match was a generic complaint whose reply was a bare DM invitation link (`CID 1557363`).
-   - *Improvement*: Solved in the final agent by retrieving top 4 cases, allowing the LLM to ignore the DM invite and synthesize diagnostic questions from the other cases.
+**2. Apple ID misclassified as Apps & Storage (conversation 811638)**
+
+The customer wrote: *"Hi trying to download a game on to my phone but keeps telling payment failed, can't sign in to itunes too."*
+
+The model predicted `Apps & Storage`. The word "download" is strongly associated with app downloads in training data. But "payment failed" and "can't sign in to iTunes" are Apple ID signals. A bag-of-words model cannot figure out that the download problem is a symptom of an account problem. This one matters beyond accuracy — the escalation rule for account credentials only triggers on `Apple ID`, so this customer's billing issue gets auto-handled instead of being escalated.
+
+**3. Screen & Camera misclassified as Phone Performance (conversation 2064248)**
+
+The customer wrote: *"updated 11.0.2 and now my phone is freezing up and screen rotation sticking in landscape mode!!!!"*
+
+Multiple symptoms in one message. "Freezing up" is a strong `Phone Performance` signal. "Screen rotation sticking" points more to `Screen & Camera`. The classifier has to pick one and it picks the more frequent one. There is no way for a single-label classifier to know which grievance the customer cares about more without understanding the whole sentence.
+
+**4. Battery misclassified as Sound & Bluetooth (conversation 1028445)**
+
+The customer wrote: *"my phone died and now ive plugged it in and its completely blackscreen and it wont even show the charging symbol HELP @AppleSupport."*
+
+There is no word "battery" in this message. The training data used keywords like "battery," "drain," "charge" to label Battery examples. But "phone died," "won't show charging symbol," and "blackscreen after plugging in" are also battery failure signals — just described differently. The weak supervision rules did not cover these phrasings, so the classifier had nothing to latch onto.
+
+**5. Retrieval drift for AirPods (resolved in the final agent)**
+
+For an AirPods Bluetooth disconnection query, the top-1 retrieval result was a generic "Please DM us" response from a lost AirPod case — useless. If you only take the top-1 match, you generate a useless routing reply. The fix was to retrieve the top 4 historical cases, letting the LLM ignore the unhelpful match and synthesize the diagnostic questions from the other three. This is now working correctly in the final agent.
 
 ---
 
-## 12. "What Is Misleading About My Headline Number?"
+## What Is Misleading About My Headline Number?
 
-A standard engineering pitfall is reporting validation accuracy as true system capability. Our system achieved:
-* **Validation Accuracy (Weak Labels)**: **91.06%**
-* **Golden Set Accuracy (Benchmark)**: **70.56%** (~20.5% drop)
+The classifier validation accuracy is **91.06%**.
 
-### Why the 91.06% Number Is Misleading:
-1. **Heuristic Rule Leakage**: The weak-labeled training data was generated using keyword patterns. The validation split was evaluated against those same rules, creating an artificially easy, closed-world test.
-2. **Distribution Shift**: Real customer complaints in the Golden Set contain organic phrasing, emotional slang, typos, and multi-symptom rants not captured in clean heuristic patterns.
-3. **Class Starvation**: Minority classes like `Other` (only 14 training examples) achieved 0.0% recall on the Golden Set, dragging down real-world performance while remaining invisible in the validation headline score.
-4. **Cascading Pipeline Vulnerability**: A 70.56% classifier accuracy means ~29.4% of queries enter downstream retrieval with suboptimal intent context, causing cascading policy escalation errors.
+That number sounds good. It is not the number you should care about.
 
----
+Here is why:
 
-## 13. What I Would Improve With One More Week
+**The validation data was generated by the same keyword rules used for training.** I wrote patterns like `"battery|drain|plugged"` to label training examples as `Battery`. Then I trained on 80% of those, tested on 20%, and got 91% accuracy. Of course the model does well — it is being tested on examples constructed by the same rules it was trained on. It is like studying a practice test and then being given the same questions.
 
-1. **Lightweight Semantic Hybrid Retrieval**: Combine sparse TF-IDF with small dense sentence embeddings (e.g. `all-MiniLM-L6-v2`) via reciprocal rank fusion to capture technical vocabulary without losing semantic synonyms.
-2. **Confidence-Gated Escalation Tuning**: Optimize the softmax confidence threshold (currently `0.35`) using ROC analysis on a validation split to maximize recall on safety-critical escalation cases.
-3. **Multi-Label Intent Support**: Allow the classifier to output secondary intent tags for compound customer complaints (e.g. iOS update + battery drain).
-4. **Automated URL Verification**: Cross-reference retrieved Apple Support URLs against active documentation endpoints to prevent serving deprecated 2017 links.
+**The real test is the Golden Set: 70.56%.** That is a 20-point drop. The Golden Set contains real customer messages with slang, typos, emotional venting, and multi-symptom complaints that keyword patterns never anticipated.
+
+Two more things that make the headline number misleading:
+
+- **`Other` is invisible.** The `Other` class scored 0.0% F1 on the Golden Set. But because it is a minority class, it barely moves the average accuracy metric. A system that completely fails at "ambiguous messages" looks fine on paper.
+
+- **Escalation errors are not independent.** The 70.56% classifier accuracy means roughly 30% of queries go into escalation with the wrong intent label. The 62.15% escalation adherence is partly a consequence of that — not a separate failure. Reporting them as two separate numbers makes both look more independent than they are.
 
 ---
 
-## 14. Repository Structure
+## What I Would Do With One More Week
 
-```text
-Hiver/
-├── .gitignore                          # Excludes raw data, caches, and generated prediction CSVs
-├── requirements.txt                    # Minimal genuine dependencies (pandas, numpy, sklearn, openai)
-├── README.md                           # Comprehensive report and reproduction documentation
-├── docs/
-│   └── decision_log.md                 # 15 structured architectural decisions (Decision, Why, Trade-off)
-├── Dataset/
-│   └── processed/
-│       ├── golden_set.csv              # Tracked 214-example evaluation benchmark (manually reviewed)
-│       └── training_data.csv           # Tracked 894-example weak-labeled training dataset
-└── src/
-    ├── data/
-    │   ├── extract_apple.py            # Extracts AppleSupport conversations from TWCS
-    │   ├── clean_apple.py              # Conservative cleaning, HTML entity decoding, URL normalization
-    │   ├── create_labels.py            # Generates weak-label training data
-    │   └── audit_labels.py             # Reproducible weak-label quality audit (91.0% precision)
-    ├── models/
-    │   └── train_intent_classifier.py  # Trains TF-IDF + Logistic Regression intent classifier
-    ├── retrieval/
-    │   └── retrieve_similar.py         # Multi-case historical retrieval excluding Golden Set
-    ├── agent/
-    │   ├── baseline_canned.py          # Baseline 1: Intent + generic canned response
-    │   ├── baseline_retrieval.py       # Baseline 2: Top-1 verbatim historical retrieval
-    │   └── support_agent.py            # Final Agent: Multi-case retrieval + escalation policy + LLM
-    └── evaluation/
-        └── evaluate_system.py          # Comprehensive evaluation harness (escalation, proxies, judge)
-```
+**Add semantic retrieval alongside keyword retrieval.**
+Right now retrieval is purely lexical. A customer who writes "my phone won't turn on after the update" and one who writes "device stuck on black screen post-iOS install" describe the same problem but share few words. I would add a small sentence embedding model (like `all-MiniLM-L6-v2`, which runs on CPU in under 1 second) and combine its scores with TF-IDF using reciprocal rank fusion.
+
+**Tune the escalation confidence threshold properly.**
+The current threshold of 0.35 was set by intuition — "below 35% softmax confidence, escalate to be safe." I would do a proper ROC analysis: sweep the threshold from 0.1 to 0.9, measure false auto-handle rate (safety risk) versus false escalation rate (customer friction), and pick the threshold that minimises safety risk while keeping escalation volume manageable.
+
+**Add multi-label intent support.**
+Several failure cases involved compound complaints (battery problem and black screen, keyboard bug and screen layout). A multi-label classifier would let the agent say "this is primarily Battery, but also Screen & Camera" and adjust both retrieval and escalation accordingly.
+
+**Validate the LLM judge with actual humans.**
+Right now the judge is `phi3:mini` evaluating `phi3:mini`. I would get a few people to each score a random sample of replies across all three systems and compute Spearman correlation and Cohen's kappa against the LLM judge. If correlation is high, the automated judge is trustworthy. If not, I need a better judge or a different evaluation approach entirely.
 
 ---
 
-## 15. Reproduction Guide
+## How to Run It
 
-### Environment Setup
 ```bash
 git clone https://github.com/sohaa-khan11/Hiver-SDE.git
 cd Hiver-SDE
 pip install -r requirements.txt
 ```
 
-### 1. Run the Entire Deterministic Pipeline (Zero Local LLM Inference Required)
-All core components run completely self-contained on standard CPU:
-
+**The full deterministic pipeline (no Ollama needed):**
 ```bash
-# 1. Train and evaluate the intent classifier on the Golden Set
-python src/models/train_intent_classifier.py
-
-# 2. Test historical evidence retrieval (top matching cases)
-python src/retrieval/retrieve_similar.py
-
-# 3. Run the two reply baselines
-python src/agent/baseline_canned.py
-python src/agent/baseline_retrieval.py
-
-# 4. Run the final support agent (deterministic escalation + fallback reply)
-python src/agent/support_agent.py
-
-# 5. Run the system evaluation harness on the Golden Set
-python src/evaluation/evaluate_system.py
+python src/models/train_intent_classifier.py   # train classifier, see Golden Set results
+python src/agent/baseline_canned.py            # run canned-reply baseline
+python src/agent/baseline_retrieval.py         # run retrieval-only baseline
+python src/evaluation/evaluate_system.py       # full evaluation (escalation + proxy metrics)
 ```
 
-### 2. Live Local LLM Generation & Judge Evaluation via Ollama
-The generative components use an open-weight local model (`phi3:mini`) served via [Ollama](https://ollama.com). No API keys, credentials, or cloud subscriptions are required:
+**Live LLM generation and judge (requires Ollama):**
+```bash
+# Install Ollama from https://ollama.com, then:
+ollama pull phi3:mini
+python src/evaluation/evaluate_system.py
+# Results cache to Dataset/processed/llm_generation_cache.csv and llm_judge_results.csv
+# Re-runs load from cache instantly
+```
 
-1. **Install and launch Ollama**:
-   Download and install from [ollama.com](https://ollama.com). Ensure the local server is running at `http://127.0.0.1:11434`.
-2. **Pull the model**:
-   ```bash
-   ollama pull phi3:mini
-   ```
-3. **Execute live support agent testing**:
-   ```bash
-   python src/agent/support_agent.py
-   ```
-4. **Execute live LLM generation and LLM-as-Judge evaluation**:
-   ```bash
-   python src/evaluation/evaluate_system.py
-   ```
-   *Note: Responses are automatically cached to `Dataset/processed/llm_generation_cache.csv` and `Dataset/processed/llm_judge_results.csv`. Subsequent runs execute in seconds.*
+**To regenerate everything from the raw Kaggle data:**
+```bash
+# Place twcs.csv at Dataset/twcs/twitter_support.csv (~493 MB, not tracked in git)
+python src/data/extract_apple.py
+python src/data/clean_apple.py
+python src/data/create_labels.py
+python src/data/audit_labels.py
+```
 
-### 3. Optional: Raw Dataset Extraction & Regeneration
-If you wish to re-extract the full dataset from scratch:
-1. Download `customer-support-on-twitter.zip` from Kaggle.
-2. Place `twcs.csv` at `Dataset/twcs/twitter_support.csv` (note: ~493 MB, intentionally ignored by Git).
-3. Execute the extraction and cleaning scripts:
-   ```bash
-   python src/data/extract_apple.py
-   python src/data/clean_apple.py
-   python src/data/create_labels.py
-   python src/data/audit_labels.py
-   ```
+---
+
+## Repository Layout
+
+```
+Hiver/
+├── README.md                            <- This file
+├── requirements.txt                     <- pandas, numpy, scikit-learn (no paid APIs)
+├── .gitignore
+├── docs/
+│   └── decision_log.md                  <- 15 plain-English decisions and why I made them
+├── Dataset/
+│   └── processed/
+│       ├── golden_set.csv               <- 214-example evaluation benchmark (tracked)
+│       └── training_data.csv            <- 894-example training set (tracked)
+│       (other CSVs are generated at runtime and git-ignored)
+└── src/
+    ├── data/
+    │   ├── extract_apple.py             <- pull AppleSupport threads from TWCS
+    │   ├── clean_apple.py               <- strip noise, decode HTML, normalise URLs
+    │   ├── create_labels.py             <- generate weak-supervised training labels
+    │   └── audit_labels.py              <- verify label quality (91% precision check)
+    ├── models/
+    │   └── train_intent_classifier.py   <- TF-IDF + Logistic Regression classifier
+    ├── retrieval/
+    │   └── retrieve_similar.py          <- TF-IDF cosine similarity retrieval engine
+    ├── agent/
+    │   ├── baseline_canned.py           <- Baseline 1: static canned replies by intent
+    │   ├── baseline_retrieval.py        <- Baseline 2: verbatim top-1 historical reply
+    │   └── support_agent.py             <- Final agent: retrieval + escalation + LLM
+    └── evaluation/
+        └── evaluate_system.py           <- evaluation harness (metrics, judge, caching)
+```

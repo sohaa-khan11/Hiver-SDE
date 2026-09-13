@@ -10,9 +10,9 @@ Pipeline:
   3. Deterministic Escalation Policy: Evaluates whether the inquiry is safe to AUTO-HANDLE
      or must ESCALATE (account security, physical hardware defects, fatal crashes, low confidence).
      Applied BEFORE calling any LLM.
-  4. Grounded LLM Response: For AUTO-HANDLE cases, prompts a single LLM (OpenAI) with the
-     customer query, predicted intent, and top 3–5 retrieved historical cases to synthesize
-     a safe, concise reply grounded strictly in historical evidence.
+  4. Grounded LLM Response: For AUTO-HANDLE cases, prompts a local open-weight model
+     (phi3:mini via Ollama) with the customer query, predicted intent, and top 3–5 retrieved
+     historical cases to synthesize a safe, concise reply grounded strictly in historical evidence.
 
 Data Governance Rule:
   golden_set.csv is held out strictly for evaluation. All Golden Set conversation IDs are
