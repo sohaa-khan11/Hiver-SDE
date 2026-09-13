@@ -73,7 +73,7 @@ Each decision follows the structure:
 ---
 
 ### Decision 10: Deterministic Pre-LLM Escalation Guardrails & Policy Alignment
-- **Decision:** Hardcoded escalation routing rules (Apple ID credentials, physical hardware damage, critical crash loops, classifier confidence < 0.35) executed before calling the LLM.
+- **Decision:** Hardcoded escalation routing rules (Apple ID credentials, physical hardware damage, critical crash loops, classifier confidence < 0.35) executed before calling the LLM. The 0.35 confidence threshold was set *a priori* as a domain safety floor to catch ambiguous classifications and was intentionally NOT tuned or optimized against the Golden Set.
 - **Why:** LLMs are prone to sycophancy, hallucinating troubleshooting steps for hardware damage, or requesting passwords in chat. Escalation decisions must be 100% predictable, safe, and zero-cost.
 - **Trade-off:** Because the Golden escalation labels and the agent's rules share the same underlying policy principles, the 62.15% adherence score measures policy adherence and is subject to cascading classifier errors, rather than measuring unbiased real-world escalation accuracy.
 
@@ -100,14 +100,14 @@ Each decision follows the structure:
 
 ---
 
-### Decision 14: Sampled LLM-as-Judge Evaluation (25 Cases, ~33–35 Calls Max) with Persistent Caching
-- **Decision:** Sampled exactly 25 stratified cases for LLM-as-Judge scoring (covering all 8 intents), restricted live agent generation to AUTO-HANDLE cases (at most 8–10 calls), consolidated the 3 candidate model evaluations into 1 prompt per case (25 judge calls), and cached all outputs locally.
-- **Why:** Calling an LLM judge across all 214 cases for 3 models separately would require 642 API calls, risking rate-limit exhaustion and high cost. Restricting live generation to 8–10 AUTO-HANDLE cases and consolidating the judge to 1 call per sample case caps total project spend to ~33–35 calls maximum.
+### Decision 14: Sampled LLM-as-Judge Evaluation (25 Stratified Cases) with Persistent Caching
+- **Decision:** Sampled exactly 25 stratified cases for LLM-as-Judge scoring (covering all 8 intents, seed=42), restricted live agent generation to AUTO-HANDLE cases, consolidated the 3 candidate model evaluations into 1 prompt per case (25 judge calls in JSON mode), and cached all outputs locally.
+- **Why:** Evaluating all 214 cases across 3 models on local CPU inference would require ~600+ inference calls taking 8+ hours. Restricting live generation to sample AUTO-HANDLE cases and consolidating the judge to 1 call per sample case completes in ~20 minutes while producing representative comparative data.
 - **Trade-off:** Smaller sample size increases confidence interval width on judge metrics.
 
 ---
 
-### Decision 15: Single Isolated OpenAI Provider with Graceful Local Fallback
-- **Decision:** Implemented a single provider integration using `openai` with environment variable authentication (`OPENAI_API_KEY`) and an automated local fallback.
-- **Why:** Avoids heavy agent frameworks (LangChain/LlamaIndex) and avoids multiple redundant SDKs. The entire deterministic pipeline (classification, retrieval, escalation, baselines) runs without requiring an API key.
-- **Trade-off:** Live LLM response generation requires setting an environment key.
+### Decision 15: Local Open-Weight LLM via Ollama (`phi3:mini`) Over Paid Proprietary APIs
+- **Decision:** Replaced all dependencies on proprietary hosted APIs (OpenAI SDK, `gpt-4o-mini`, `OPENAI_API_KEY`) with a local open-weight instruction-tuned model (`phi3:mini`, 3.8B parameters) served via local Ollama (`http://127.0.0.1:11434`) using standard library HTTP requests.
+- **Why:** Complete reproducibility, zero API costs, zero rate-limit risks, no external credential requirements, and strict data privacy (customer complaints remain on-device). `phi3:mini` was selected after empirical validation: it fits easily in 2.2 GB RAM/VRAM, provides reliable JSON output formatting for judging, and follows strict negative constraints (no personal names, no hallucinated policies) with acceptable CPU inference latency (~22–25s per reply).
+- **Trade-off:** Local CPU generation is slower than commercial cloud endpoints, and using the same local model family as judge introduces potential self-grading bias (documented in evaluation).

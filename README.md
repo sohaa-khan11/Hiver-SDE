@@ -159,7 +159,9 @@ To prove the necessity and value of the final LLM agent, we established two non-
 
 ## 9. LLM-as-Judge Evaluation Framework
 
-To evaluate generation quality without excessive API spend, the evaluation harness selects an optimized representative **25-case stratified sample** from the Golden Set (seed=42, covering all 8 intents) and evaluates Baseline 1, Baseline 2, and Final Agent across 5 criteria:
+To evaluate generation quality without relying on closed proprietary APIs or incurring cloud expenses, the evaluation harness uses a local open-weight instruction-tuned model (`phi3:mini`, 3.8B parameters via local Ollama).
+
+The harness selects an optimized representative **25-case stratified sample** from the Golden Set (seed=42, covering all 8 intents) and evaluates Baseline 1, Baseline 2, and Final Agent across 5 criteria:
 
 1. **Groundedness (1–5)**: Supported strictly by official Apple evidence; zero invented facts.
 2. **Relevance (1–5)**: Addresses the current customer's specific problem.
@@ -167,22 +169,32 @@ To evaluate generation quality without excessive API spend, the evaluation harne
 4. **Support Tone (1–5)**: Polite, concise, empathetic social customer voice.
 5. **Unsupported Claim Rate (0 or 1)**: Flags hallucinated prices, repair promises, or fake steps.
 
-*Cost & API Accounting*:
-- **Consolidated prompt**: Evaluates all 3 candidate models in **1 prompt per sample case** (exactly **25 judge API calls** total).
-- **Live generation**: In the 25 sample cases, exactly 8 are `AUTO-HANDLE` and 17 are `ESCALATE`. Since `ESCALATE` cases use deterministic safe responses (0 API calls), live generation requires **at most 8–10 generation calls**.
-- **Total API calls if enabled**: **~33–35 calls maximum** (8–10 generation + 25 judge).
-- **Persistent caching**: Live replies are cached to `Dataset/processed/llm_generation_cache.csv` and judge scores to `Dataset/processed/llm_judge_results.csv` (0 calls on repeat runs).
-- **Current Status**: **Pending API Key** (0 calls attempted in offline mode).
+### Empirical LLM-as-Judge Results (Local `phi3:mini`, n=25 Sample):
+
+| Model | Groundedness (1–5) | Relevance (1–5) | Actionability (1–5) | Tone (1–5) | Unsupported Claim Rate (0–1) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Baseline 1 (Canned)** | 3.44 | 3.56 | 4.24 | 4.56 | **0.00** |
+| **Baseline 2 (Retrieval)** | 3.88 | 4.28 | 3.96 | 4.56 | 0.04 |
+| **Final Support Agent** | **4.32** | **4.40** | **4.48** | **4.84** | 0.04 |
+
+### Key Findings & Self-Grading Bias:
+* **Groundedness Gain (+0.88 vs Canned, +0.44 vs Retrieval)**: The Final Agent combines retrieved troubleshooting facts with customer-specific context, eliminating generic advice without blindly quoting raw past conversations.
+* **Tone & Relevance**: The Final Agent achieved the highest tone (4.84/5) and relevance (4.40/5) by stripping previous customers' names and greeting the current user directly.
+* **Important Self-Grading Bias Limitation**: Because `phi3:mini` served both as the response generator and the comparative judge, same-model preference bias is a recognized factor. While temperature was set to 0.0 and JSON schema constrained the evaluation, formal validation requires independent human ratings.
+* **Execution & Persistent Caching**:
+  - Live generated replies are cached to `Dataset/processed/llm_generation_cache.csv`.
+  - Judge scores are cached to `Dataset/processed/llm_judge_results.csv`.
+  - Re-running `python src/evaluation/evaluate_system.py` loads both caches instantly (0 repeated inference calls).
 
 ---
 
 ## 10. Human vs. LLM Judge Agreement
 
-The assignment explicitly requires evaluating human-vs-LLM agreement:
-* The harness generates a clean evaluation template: `Dataset/processed/human_eval_template.csv` containing the **exact same 25 sampled cases** used for the LLM judge, enabling direct 1:1 comparison.
-* In accordance with academic honesty, **human scores are not faked or pre-filled**. Rating columns are left blank for manual review.
+The assignment requires evaluating human-vs-LLM agreement to validate the judge's scoring reliability:
+* The harness automatically maintains `Dataset/processed/human_eval_template.csv` containing the **exact same 25 sampled cases** used for the LLM judge.
+* In accordance with academic honesty, **human scores are not fabricated or pre-filled**. Rating columns (`human_groundedness_1to5`, `human_relevance_1to5`, etc.) remain blank for authentic review.
 * **Current Status**: **Pending Manual Human Review**.
-* Once filled, running `python src/evaluation/evaluate_system.py` automatically calculates exact agreement on binary claims and Mean Absolute Error (MAE) on 1–5 metrics.
+* Once filled, running `python src/evaluation/evaluate_system.py` automatically computes exact agreement on binary unsupported claims and Mean Absolute Error (MAE) for the 1–5 metrics.
 
 ---
 
@@ -278,7 +290,7 @@ cd Hiver-SDE
 pip install -r requirements.txt
 ```
 
-### 1. Run the Entire Deterministic Pipeline (Zero API Key Required)
+### 1. Run the Entire Deterministic Pipeline (Zero Local LLM Inference Required)
 All core components run completely self-contained on standard CPU:
 
 ```bash
@@ -292,28 +304,31 @@ python src/retrieval/retrieve_similar.py
 python src/agent/baseline_canned.py
 python src/agent/baseline_retrieval.py
 
-# 4. Run the final support agent on the 5 representative test inquiries
+# 4. Run the final support agent (deterministic escalation + fallback reply)
 python src/agent/support_agent.py
 
-# 5. Run the comprehensive evaluation harness (escalation, automated proxies, human template)
+# 5. Run the system evaluation harness on the Golden Set
 python src/evaluation/evaluate_system.py
 ```
 
-### 2. Optional: Live LLM Generation & Judge Evaluation
-To enable live OpenAI response synthesis or LLM-as-Judge evaluation:
-```bash
-# Windows PowerShell
-$env:OPENAI_API_KEY="your-api-key-here"
+### 2. Live Local LLM Generation & Judge Evaluation via Ollama
+The generative components use an open-weight local model (`phi3:mini`) served via [Ollama](https://ollama.com). No API keys, credentials, or cloud subscriptions are required:
 
-# Windows CMD
-set OPENAI_API_KEY=your-api-key-here
-
-# Run live support agent test cases
-python src/agent/support_agent.py
-
-# Run LLM-as-Judge evaluation (cached to Dataset/processed/llm_judge_results.csv)
-python src/evaluation/evaluate_system.py
-```
+1. **Install and launch Ollama**:
+   Download and install from [ollama.com](https://ollama.com). Ensure the local server is running at `http://127.0.0.1:11434`.
+2. **Pull the model**:
+   ```bash
+   ollama pull phi3:mini
+   ```
+3. **Execute live support agent testing**:
+   ```bash
+   python src/agent/support_agent.py
+   ```
+4. **Execute live LLM generation and LLM-as-Judge evaluation**:
+   ```bash
+   python src/evaluation/evaluate_system.py
+   ```
+   *Note: Responses are automatically cached to `Dataset/processed/llm_generation_cache.csv` and `Dataset/processed/llm_judge_results.csv`. Subsequent runs execute in seconds.*
 
 ### 3. Optional: Raw Dataset Extraction & Regeneration
 If you wish to re-extract the full dataset from scratch:

@@ -257,6 +257,21 @@ def generate_evaluation_sample(
     return pd.DataFrame(records)
 
 
+def check_ollama_service() -> Tuple[bool, str]:
+    """Check if the local Ollama service is reachable."""
+    import urllib.request
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    url = f"{ollama_host.rstrip('/')}/api/tags"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                return True, "Ollama service online"
+    except Exception as e:
+        return False, f"Ollama unreachable at {ollama_host}: {e}"
+    return False, f"Ollama returned unexpected status"
+
+
 def apply_live_agent_generation(
     sample_df: pd.DataFrame,
     cache_path: str,
@@ -265,22 +280,22 @@ def apply_live_agent_generation(
 ) -> Tuple[pd.DataFrame, str]:
     """
     Generate live LLM responses strictly for the AUTO-HANDLE cases in the sample
-    (at most 8-10 calls, 0 for ESCALATE).
+    using local Ollama (at most 8-10 calls, 0 for ESCALATE).
     Results are permanently cached to cache_path to eliminate repeated generation.
     """
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
         cached_df = pd.read_csv(cache_path, encoding="utf-8-sig")
         cache_map = dict(zip(cached_df["sample_id"], cached_df["cached_reply"]))
         sample_df["agent_reply"] = sample_df["sample_id"].map(cache_map).fillna(sample_df["agent_reply"])
-        return sample_df, f"Loaded {len(cache_map)} cached agent replies from {cache_path} (0 API calls made)."
+        return sample_df, f"Loaded {len(cache_map)} cached agent replies from {cache_path} (0 local LLM calls made)."
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return sample_df, "Pending: OPENAI_API_KEY not configured. Using offline reference fallbacks for agent replies."
+    is_online, status_msg = check_ollama_service()
+    if not is_online:
+        return sample_df, f"Pending: Local Ollama service not running ({status_msg}). Using offline reference fallbacks for agent replies."
 
     records = []
     auto_handle_count = 0
-    print(f"Generating live agent responses for AUTO-HANDLE cases (max {max_auto_handle_calls} calls)...")
+    print(f"Generating live agent responses for AUTO-HANDLE cases via local Ollama (max {max_auto_handle_calls} calls)...")
 
     for idx, row in sample_df.iterrows():
         sid = row["sample_id"]
@@ -288,11 +303,15 @@ def apply_live_agent_generation(
         decision = row["agent_decision"]
 
         if decision == "ESCALATE":
-            reply = row["agent_reply"]  # deterministic safe response (0 API calls)
+            reply = row["agent_reply"]  # deterministic safe response (0 LLM calls)
         elif auto_handle_count < max_auto_handle_calls:
+            print(f"  [Sample {sid:02d}] Generating response for AUTO-HANDLE inquiry...")
+            t0 = time.time()
             res = agent.process_message(c_msg, enable_llm=True)
+            dt = time.time() - t0
             reply = res["final_reply"]
             auto_handle_count += 1
+            print(f"    Done in {dt:.1f}s. LLM Used: {res.get('llm_used')}")
         else:
             reply = row["agent_reply"]
 
@@ -305,26 +324,25 @@ def apply_live_agent_generation(
 
 def run_llm_judge_sample(sample_df: pd.DataFrame, output_path: str) -> Tuple[Optional[pd.DataFrame], str]:
     """
-    Run consolidated LLM-as-Judge on exactly 25 sample cases (1 call per case = 25 calls max).
-    Uses caching: if output_path exists and is non-empty, loads from cache without API calls.
-    If OPENAI_API_KEY is not configured, gracefully reports pending status.
+    Run consolidated LLM-as-Judge on exactly 25 sample cases (1 call per case = 25 calls max)
+    using local Ollama with JSON mode.
+    Uses caching: if output_path exists and is non-empty, loads from cache without inference calls.
     """
     if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
         cached = pd.read_csv(output_path, encoding="utf-8-sig")
-        return cached, f"Loaded cached LLM-as-Judge results from {output_path} (0 API calls made)."
+        return cached, f"Loaded cached LLM-as-Judge results from {output_path} (0 local LLM calls made)."
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None, "Pending: OPENAI_API_KEY not configured in environment. LLM judge evaluation skipped (deterministic pipeline intact)."
+    is_online, status_msg = check_ollama_service()
+    if not is_online:
+        return None, f"Pending: Local Ollama service not running ({status_msg}). LLM judge evaluation skipped (deterministic pipeline intact)."
 
-    try:
-        import openai
-        client = openai.OpenAI(api_key=api_key)
-    except ImportError:
-        return None, "Pending: 'openai' package required to run live judge."
+    import urllib.request
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    model_name = os.environ.get("OLLAMA_MODEL", "phi3:mini")
+    chat_url = f"{ollama_host.rstrip('/')}/api/chat"
 
     results = []
-    print(f"Running Consolidated LLM-as-Judge on {len(sample_df)} sample cases (1 call per case = {len(sample_df)} total API calls)...")
+    print(f"Running Consolidated LLM-as-Judge via local Ollama ({model_name}) on {len(sample_df)} sample cases...")
 
     model_mapping = {
         "candidate_1": "Baseline 1 (Canned)",
@@ -332,7 +350,7 @@ def run_llm_judge_sample(sample_df: pd.DataFrame, output_path: str) -> Tuple[Opt
         "candidate_3": "Final Support Agent"
     }
 
-    for _, row in sample_df.iterrows():
+    for i, (_, row) in enumerate(sample_df.iterrows(), 1):
         prompt = CONSOLIDATED_JUDGE_PROMPT.format(
             customer_message=row["customer_message"],
             intent=row["intent"],
@@ -342,29 +360,46 @@ def run_llm_judge_sample(sample_df: pd.DataFrame, output_path: str) -> Tuple[Opt
             agent_reply=row["agent_reply"]
         )
 
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {
+                "temperature": 0.0,
+                "num_predict": 250
+            },
+            "format": "json",
+            "stream": False
+        }
+
         parsed_scores = {}
+        print(f"  [Judge Case {i:02d}/{len(sample_df)}] Evaluating candidates...", end="", flush=True)
+        t0 = time.time()
         for attempt in range(2):
             try:
-                completion = client.chat.completions.create(
-                    model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    max_tokens=300
+                req = urllib.request.Request(
+                    chat_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
                 )
-                content = completion.choices[0].message.content.strip()
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                content = res.get("message", {}).get("content", "").strip()
                 match = re.search(r"\{.*\}", content, re.DOTALL)
                 if match:
                     parsed_scores = json.loads(match.group(0))
                     break
-            except Exception:
+            except Exception as e:
                 time.sleep(1)
 
-        for cand_key, model_name in model_mapping.items():
+        dt = time.time() - t0
+        print(f" done ({dt:.1f}s)")
+
+        for cand_key, model_name_str in model_mapping.items():
             scores = parsed_scores.get(cand_key, {})
             results.append({
                 "sample_id": row["sample_id"],
                 "conversation_id": row["conversation_id"],
-                "model_name": model_name,
+                "model_name": model_name_str,
                 "groundedness": scores.get("groundedness", 3),
                 "relevance": scores.get("relevance", 3),
                 "actionability": scores.get("actionability", 3),
@@ -374,7 +409,7 @@ def run_llm_judge_sample(sample_df: pd.DataFrame, output_path: str) -> Tuple[Opt
 
     judge_df = pd.DataFrame(results)
     judge_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    return judge_df, f"Successfully executed LLM-as-Judge ({len(sample_df)} calls) and cached to {output_path}."
+    return judge_df, f"Successfully executed LLM-as-Judge ({len(sample_df)} calls via local {model_name}) and cached to {output_path}."
 
 
 # ==============================================================================
